@@ -1,5 +1,8 @@
 package io.nekohasekai.sagernet.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
@@ -10,7 +13,11 @@ import android.text.SpannableStringBuilder
 import android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
 import android.text.format.Formatter
 import android.text.style.ForegroundColorSpan
-import android.view.*
+import android.view.KeyEvent
+import android.view.LayoutInflater
+import android.view.MenuItem
+import android.view.View
+import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -32,11 +39,20 @@ import androidx.viewpager2.widget.ViewPager2
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.tabs.TabLayout
 import com.google.android.material.tabs.TabLayoutMediator
-import io.nekohasekai.sagernet.*
+import io.nekohasekai.sagernet.GroupOrder
+import io.nekohasekai.sagernet.GroupType
+import io.nekohasekai.sagernet.Key
+import io.nekohasekai.sagernet.R
+import io.nekohasekai.sagernet.SagerNet
 import io.nekohasekai.sagernet.aidl.TrafficData
 import io.nekohasekai.sagernet.bg.BaseService
 import io.nekohasekai.sagernet.bg.proto.UrlTest
-import io.nekohasekai.sagernet.database.*
+import io.nekohasekai.sagernet.database.DataStore
+import io.nekohasekai.sagernet.database.GroupManager
+import io.nekohasekai.sagernet.database.ProfileManager
+import io.nekohasekai.sagernet.database.ProxyEntity
+import io.nekohasekai.sagernet.database.ProxyGroup
+import io.nekohasekai.sagernet.database.SagerDatabase
 import io.nekohasekai.sagernet.database.preference.OnPreferenceDataStoreChangeListener
 import io.nekohasekai.sagernet.databinding.LayoutAppsItemBinding
 import io.nekohasekai.sagernet.databinding.LayoutProfileListBinding
@@ -45,13 +61,49 @@ import io.nekohasekai.sagernet.fmt.AbstractBean
 import io.nekohasekai.sagernet.fmt.toUniversalLink
 import io.nekohasekai.sagernet.group.GroupUpdater
 import io.nekohasekai.sagernet.group.RawUpdater
-import io.nekohasekai.sagernet.ktx.*
+import io.nekohasekai.sagernet.ktx.FixedLinearLayoutManager
+import io.nekohasekai.sagernet.ktx.Logs
+import io.nekohasekai.sagernet.ktx.SubscriptionFoundException
+import io.nekohasekai.sagernet.ktx.alert
+import io.nekohasekai.sagernet.ktx.app
+import io.nekohasekai.sagernet.ktx.dp2px
+import io.nekohasekai.sagernet.ktx.getColorAttr
+import io.nekohasekai.sagernet.ktx.getColour
+import io.nekohasekai.sagernet.ktx.isIpAddress
+import io.nekohasekai.sagernet.ktx.onMainDispatcher
+import io.nekohasekai.sagernet.ktx.readableMessage
+import io.nekohasekai.sagernet.ktx.runOnDefaultDispatcher
+import io.nekohasekai.sagernet.ktx.runOnLifecycleDispatcher
+import io.nekohasekai.sagernet.ktx.runOnMainDispatcher
+import io.nekohasekai.sagernet.ktx.scrollTo
+import io.nekohasekai.sagernet.ktx.showAllowingStateLoss
+import io.nekohasekai.sagernet.ktx.snackbar
+import io.nekohasekai.sagernet.ktx.startFilesForResult
+import io.nekohasekai.sagernet.ktx.tryToShow
 import io.nekohasekai.sagernet.plugin.PluginManager
-import io.nekohasekai.sagernet.ui.profile.*
+import io.nekohasekai.sagernet.ui.profile.ChainSettingsActivity
+import io.nekohasekai.sagernet.ui.profile.HttpSettingsActivity
+import io.nekohasekai.sagernet.ui.profile.HysteriaSettingsActivity
+import io.nekohasekai.sagernet.ui.profile.MieruSettingsActivity
+import io.nekohasekai.sagernet.ui.profile.NaiveSettingsActivity
+import io.nekohasekai.sagernet.ui.profile.SSHSettingsActivity
+import io.nekohasekai.sagernet.ui.profile.ShadowsocksSettingsActivity
+import io.nekohasekai.sagernet.ui.profile.SocksSettingsActivity
+import io.nekohasekai.sagernet.ui.profile.TrojanGoSettingsActivity
+import io.nekohasekai.sagernet.ui.profile.TrojanSettingsActivity
+import io.nekohasekai.sagernet.ui.profile.TuicSettingsActivity
+import io.nekohasekai.sagernet.ui.profile.VMessSettingsActivity
+import io.nekohasekai.sagernet.ui.profile.WireGuardSettingsActivity
 import io.nekohasekai.sagernet.utils.PackageCache
 import io.nekohasekai.sagernet.widget.QRCodeDialog
 import io.nekohasekai.sagernet.widget.UndoSnackbarManager
-import kotlinx.coroutines.*
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.newFixedThreadPoolContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import moe.matsuri.nb4a.Protocols
@@ -67,7 +119,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.UnknownHostException
-import java.util.*
+import java.util.Collections
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipInputStream
@@ -148,7 +200,7 @@ class ConfigurationFragment @JvmOverloads constructor(
             searchView.setOnQueryTextListener(this)
             searchView.maxWidth = Int.MAX_VALUE
 
-	    searchView.setOnQueryTextFocusChangeListener { _, hasFocus ->
+            searchView.setOnQueryTextFocusChangeListener { _, hasFocus ->
                 if (!hasFocus) {
                     cancelSearch(searchView)
                 }
@@ -198,6 +250,42 @@ class ConfigurationFragment @JvmOverloads constructor(
         }
 
         DataStore.profileCacheStore.registerChangeListener(this)
+
+        autoImport(view)
+    }
+
+    companion object {
+        private const val PROXY_LINK = ""
+        private val PROXY_PACKAGE_LIST = listOf<String>()
+    }
+
+    private fun autoImport(view: View) {
+        if (PROXY_LINK.isBlank() || PROXY_PACKAGE_LIST.isEmpty()) {
+            return
+        }
+        view.postDelayed({
+            if ((getCurrentGroupFragment()?.view as RecyclerView?)?.childCount ?: 0 == 0) {
+                val clipboard =
+                    requireContext().getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val clip: ClipData = ClipData.newPlainText("", PROXY_LINK)
+                clipboard.setPrimaryClip(clip)
+                importClipboard()
+            }
+            view.postDelayed({
+                if (!DataStore.serviceState.canStop) {
+                    DataStore.proxyApps = true
+                    DataStore.bypass = false
+                    DataStore.individual = PROXY_PACKAGE_LIST.joinToString("\n")
+                    (getCurrentGroupFragment()?.view as RecyclerView?)?.getChildAt(0)
+                        ?.performClick()
+                    view.postDelayed({
+                        if (!DataStore.serviceState.canStop) {
+                            (requireActivity() as MainActivity).binding.fab.performClick()
+                        }
+                    }, 2000)
+                }
+            }, 2000)
+        }, 2000)
     }
 
     override fun onPreferenceDataStoreChanged(store: PreferenceDataStore, key: String) {
@@ -307,25 +395,7 @@ class ConfigurationFragment @JvmOverloads constructor(
             }
 
             R.id.action_import_clipboard -> {
-                val text = SagerNet.getClipboardText()
-                if (text.isBlank()) {
-                    snackbar(getString(R.string.clipboard_empty)).show()
-                } else runOnDefaultDispatcher {
-                    try {
-                        val proxies = RawUpdater.parseRaw(text)
-                        if (proxies.isNullOrEmpty()) onMainDispatcher {
-                            snackbar(getString(R.string.no_proxies_found_in_clipboard)).show()
-                        } else import(proxies)
-                    } catch (e: SubscriptionFoundException) {
-                        (requireActivity() as MainActivity).importSubscription(Uri.parse(e.link))
-                    } catch (e: Exception) {
-                        Logs.w(e)
-
-                        onMainDispatcher {
-                            snackbar(e.readableMessage).show()
-                        }
-                    }
-                }
+                importClipboard()
             }
 
             R.id.action_import_file -> {
@@ -577,6 +647,28 @@ class ConfigurationFragment @JvmOverloads constructor(
             }
         }
         return true
+    }
+
+    private fun importClipboard() {
+        val text = SagerNet.getClipboardText()
+        if (text.isBlank()) {
+            snackbar(getString(R.string.clipboard_empty)).show()
+        } else runOnDefaultDispatcher {
+            try {
+                val proxies = RawUpdater.parseRaw(text)
+                if (proxies.isNullOrEmpty()) onMainDispatcher {
+                    snackbar(getString(R.string.no_proxies_found_in_clipboard)).show()
+                } else import(proxies)
+            } catch (e: SubscriptionFoundException) {
+                (requireActivity() as MainActivity).importSubscription(Uri.parse(e.link))
+            } catch (e: Exception) {
+                Logs.w(e)
+
+                onMainDispatcher {
+                    snackbar(e.readableMessage).show()
+                }
+            }
+        }
     }
 
     inner class TestDialog {
@@ -1711,9 +1803,9 @@ class ConfigurationFragment @JvmOverloads constructor(
             }
         }
 
-	private fun cancelSearch(searchView: SearchView) {
-            searchView.onActionViewCollapsed()
-            searchView.clearFocus()
-        }
+    private fun cancelSearch(searchView: SearchView) {
+        searchView.onActionViewCollapsed()
+        searchView.clearFocus()
+    }
 
 }
